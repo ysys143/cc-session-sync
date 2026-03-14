@@ -49,6 +49,8 @@ struct SessionLogEntry {
     parent_tool_use_id: Option<String>,
     #[serde(default, rename = "isSidechain")]
     is_sidechain: bool,
+    #[serde(default, rename = "toolUseResult")]
+    tool_use_result: Option<serde_json::Value>,
 }
 
 impl SessionLogEntry {
@@ -100,7 +102,7 @@ impl SessionLogEntry {
                                 if let Some(rc) = result_content {
                                     if let Some(s) = rc.as_str() {
                                         if !s.is_empty() {
-                                            parts.push(format!("> {}", s.lines().take(20).collect::<Vec<_>>().join("\n> ")));
+                                            parts.push(format!("> {}", s.lines().collect::<Vec<_>>().join("\n> ")));
                                         }
                                     } else if let Some(rc_arr) = rc.as_array() {
                                         for item in rc_arr {
@@ -121,6 +123,29 @@ impl SessionLogEntry {
                     }
                 }
                 None
+            }).or_else(|| {
+                // Fallback: use toolUseResult for entries with no message content
+                self.tool_use_result.as_ref().and_then(|r| {
+                    if let Some(s) = r.as_str() {
+                        if !s.is_empty() {
+                            return Some(format!("> [Error] {}", s));
+                        }
+                    } else if r.is_object() {
+                        let stdout = r.get("stdout").and_then(|v| v.as_str()).unwrap_or("");
+                        let stderr = r.get("stderr").and_then(|v| v.as_str()).unwrap_or("");
+                        let mut parts = Vec::new();
+                        if !stdout.is_empty() {
+                            parts.push(format!("> {}", stdout.lines().collect::<Vec<_>>().join("\n> ")));
+                        }
+                        if !stderr.is_empty() {
+                            parts.push(format!("> [stderr] {}", stderr.lines().collect::<Vec<_>>().join("\n> ")));
+                        }
+                        if !parts.is_empty() {
+                            return Some(parts.join("\n\n"));
+                        }
+                    }
+                    None
+                })
             })
         })
     }
