@@ -459,7 +459,9 @@ fn convert_session_to_markdown(entries: &[SessionLogEntry]) -> String {
 
 fn main() -> Result<()> {
     let projects_dir = expand_home("~/.claude/projects");
-    let obsidian_vault = expand_home("~/Documents/Obsidian/claude-code-sessions");
+    let obsidian_vault = std::env::var("CLAUDE_SESSIONS_PATH")
+        .map(|p| expand_home(&p))
+        .unwrap_or_else(|_| expand_home("~/Documents/Obsidian/claude-code-sessions"));
 
     if !projects_dir.exists() {
         anyhow::bail!("Projects directory not found: {:?}", projects_dir);
