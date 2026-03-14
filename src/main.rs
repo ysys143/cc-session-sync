@@ -108,7 +108,7 @@ impl SessionLogEntry {
                                         for item in rc_arr {
                                             if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
                                                 if !t.is_empty() {
-                                                    parts.push(format!("> {}", t.lines().take(20).collect::<Vec<_>>().join("\n> ")));
+                                                    parts.push(format!("> {}", t.lines().collect::<Vec<_>>().join("\n> ")));
                                                 }
                                             }
                                         }
