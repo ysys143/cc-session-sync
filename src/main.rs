@@ -1,27 +1,16 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
-#[derive(Debug, Serialize, Deserialize)]
-struct Metadata {
-    last_synced_timestamp: u64,
-    total_entries_synced: usize,
-}
+// ── Entry struct ─────────────────────────────────────────────────────────────
 
-impl Default for Metadata {
-    fn default() -> Self {
-        Self {
-            last_synced_timestamp: 0,
-            total_entries_synced: 0,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 struct SessionLogEntry {
     #[serde(default)]
     display: Option<String>,
@@ -56,11 +45,11 @@ struct SessionLogEntry {
 impl SessionLogEntry {
     fn get_display(&self) -> Option<String> {
         self.display.clone().or_else(|| {
-            // For progress entries, extract bash output
             if self.entry_type.as_deref() == Some("progress") {
                 if let Some(data) = &self.data {
                     if data.get("type").and_then(|t| t.as_str()) == Some("bash_progress") {
-                        let output = data.get("fullOutput")
+                        let output = data
+                            .get("fullOutput")
                             .or_else(|| data.get("output"))
                             .and_then(|o| o.as_str())
                             .unwrap_or("");
@@ -71,74 +60,71 @@ impl SessionLogEntry {
                 }
                 return None;
             }
-            self.message.as_ref().and_then(|msg| {
-                let content = msg.get("content")?;
-                // Try string first
-                if let Some(s) = content.as_str() {
-                    return Some(s.to_string());
-                }
-                // Try array of content blocks
-                if let Some(arr) = content.as_array() {
-                    let mut parts: Vec<String> = Vec::new();
-                    for block in arr {
-                        let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                        match block_type {
-                            "text" => {
-                                if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
-                                    if !t.is_empty() {
-                                        parts.push(t.to_string());
+            self.message
+                .as_ref()
+                .and_then(|msg| {
+                    let content = msg.get("content")?;
+                    if let Some(s) = content.as_str() {
+                        return Some(s.to_string());
+                    }
+                    if let Some(arr) = content.as_array() {
+                        let mut parts: Vec<String> = Vec::new();
+                        for block in arr {
+                            let block_type =
+                                block.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                            match block_type {
+                                "text" => {
+                                    if let Some(t) =
+                                        block.get("text").and_then(|t| t.as_str())
+                                    {
+                                        if !t.is_empty() {
+                                            parts.push(t.to_string());
+                                        }
                                     }
                                 }
-                            }
-                            "tool_use" => {
-                                let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
-                                let input = block.get("input")
-                                    .map(|i| serde_json::to_string(i).unwrap_or_default())
-                                    .unwrap_or_default();
-                                parts.push(format!("> **Tool: {}** `{}`", name, input));
-                            }
-                            "tool_result" => {
-                                let result_content = block.get("content");
-                                if let Some(rc) = result_content {
-                                    if let Some(s) = rc.as_str() {
-                                        if !s.is_empty() {
-                                            parts.push(format!("> {}", s.lines().collect::<Vec<_>>().join("\n> ")));
-                                        }
-                                    } else if let Some(rc_arr) = rc.as_array() {
-                                        for item in rc_arr {
-                                            if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
-                                                if !t.is_empty() {
-                                                    parts.push(format!("> {}", t.lines().collect::<Vec<_>>().join("\n> ")));
+                                "tool_use" => {
+                                    let name = block
+                                        .get("name")
+                                        .and_then(|n| n.as_str())
+                                        .unwrap_or("unknown");
+                                    let input = block
+                                        .get("input")
+                                        .map(|i| serde_json::to_string(i).unwrap_or_default())
+                                        .unwrap_or_default();
+                                    parts.push(format!("> **Tool: {}** `{}`", name, input));
+                                }
+                                "tool_result" => {
+                                    let result_content = block.get("content");
+                                    if let Some(rc) = result_content {
+                                        if let Some(s) = rc.as_str() {
+                                            if !s.is_empty() {
+                                                parts.push(format!(
+                                                    "> {}",
+                                                    s.lines()
+                                                        .collect::<Vec<_>>()
+                                                        .join("\n> ")
+                                                ));
+                                            }
+                                        } else if let Some(rc_arr) = rc.as_array() {
+                                            for item in rc_arr {
+                                                if let Some(t) =
+                                                    item.get("text").and_then(|t| t.as_str())
+                                                {
+                                                    if !t.is_empty() {
+                                                        parts.push(format!(
+                                                            "> {}",
+                                                            t.lines()
+                                                                .collect::<Vec<_>>()
+                                                                .join("\n> ")
+                                                        ));
+                                                    }
                                                 }
                                             }
                                         }
                                     }
                                 }
+                                _ => {}
                             }
-                            _ => {}
-                        }
-                    }
-                    if !parts.is_empty() {
-                        return Some(parts.join("\n\n"));
-                    }
-                }
-                None
-            }).or_else(|| {
-                // Fallback: use toolUseResult for entries with no message content
-                self.tool_use_result.as_ref().and_then(|r| {
-                    if let Some(s) = r.as_str() {
-                        if !s.is_empty() {
-                            return Some(format!("> [Error] {}", s));
-                        }
-                    } else if r.is_object() {
-                        let stdout = r.get("stdout").and_then(|v| v.as_str()).unwrap_or("");
-                        let stderr = r.get("stderr").and_then(|v| v.as_str()).unwrap_or("");
-                        let mut parts = Vec::new();
-                        if !stdout.is_empty() {
-                            parts.push(format!("> {}", stdout.lines().collect::<Vec<_>>().join("\n> ")));
-                        }
-                        if !stderr.is_empty() {
-                            parts.push(format!("> [stderr] {}", stderr.lines().collect::<Vec<_>>().join("\n> ")));
                         }
                         if !parts.is_empty() {
                             return Some(parts.join("\n\n"));
@@ -146,28 +132,54 @@ impl SessionLogEntry {
                     }
                     None
                 })
-            })
+                .or_else(|| {
+                    self.tool_use_result.as_ref().and_then(|r| {
+                        if let Some(s) = r.as_str() {
+                            if !s.is_empty() {
+                                return Some(format!("> [Error] {}", s));
+                            }
+                        } else if r.is_object() {
+                            let stdout = r.get("stdout").and_then(|v| v.as_str()).unwrap_or("");
+                            let stderr = r.get("stderr").and_then(|v| v.as_str()).unwrap_or("");
+                            let mut parts = Vec::new();
+                            if !stdout.is_empty() {
+                                parts.push(format!(
+                                    "> {}",
+                                    stdout.lines().collect::<Vec<_>>().join("\n> ")
+                                ));
+                            }
+                            if !stderr.is_empty() {
+                                parts.push(format!(
+                                    "> [stderr] {}",
+                                    stderr.lines().collect::<Vec<_>>().join("\n> ")
+                                ));
+                            }
+                            if !parts.is_empty() {
+                                return Some(parts.join("\n\n"));
+                            }
+                        }
+                        None
+                    })
+                })
         })
     }
-}
 
-impl SessionLogEntry {
     fn get_timestamp_millis(&self) -> u64 {
         match &self.timestamp {
             Some(ts) => match ts {
                 serde_json::Value::Number(n) => n.as_u64().unwrap_or(0),
-                serde_json::Value::String(s) => {
-                    chrono::DateTime::parse_from_rfc3339(s)
-                        .ok()
-                        .map(|dt| dt.timestamp_millis() as u64)
-                        .unwrap_or(0)
-                }
+                serde_json::Value::String(s) => chrono::DateTime::parse_from_rfc3339(s)
+                    .ok()
+                    .map(|dt| dt.timestamp_millis() as u64)
+                    .unwrap_or(0),
                 _ => 0,
             },
             None => 0,
         }
     }
 }
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn expand_home(path: &str) -> PathBuf {
     if path.starts_with("~/") {
@@ -180,14 +192,14 @@ fn expand_home(path: &str) -> PathBuf {
 
 fn format_date(timestamp: u64) -> String {
     let dt = DateTime::<Local>::from(
-        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(timestamp),
+        SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(timestamp),
     );
     dt.format("%Y-%m-%d").to_string()
 }
 
 fn format_time(timestamp: u64) -> String {
     let dt = DateTime::<Local>::from(
-        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(timestamp),
+        SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(timestamp),
     );
     dt.format("%H:%M:%S").to_string()
 }
@@ -200,106 +212,147 @@ fn get_project_name(project_path: &str) -> String {
         .to_string()
 }
 
-fn load_metadata(obsidian_vault: &PathBuf) -> Metadata {
-    let metadata_file = obsidian_vault.join(".metadata.json");
-    fs::read_to_string(&metadata_file)
-        .ok()
-        .and_then(|content| serde_json::from_str(&content).ok())
-        .unwrap_or_default()
+fn file_mtime_and_size(path: &PathBuf) -> Result<(i64, i64)> {
+    let meta = fs::metadata(path).with_context(|| format!("stat {:?}", path))?;
+    let mtime = meta
+        .modified()
+        .with_context(|| format!("mtime {:?}", path))?
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let size = meta.len() as i64;
+    Ok((mtime, size))
 }
 
-fn save_metadata(obsidian_vault: &PathBuf, metadata: &Metadata) -> Result<()> {
-    let metadata_file = obsidian_vault.join(".metadata.json");
-    let json = serde_json::to_string_pretty(metadata)?;
-    fs::write(metadata_file, json)?;
+/// Parse every line of a JSONL file and return entries (invalid lines skipped).
+fn parse_jsonl(path: &PathBuf) -> Result<Vec<SessionLogEntry>> {
+    let contents =
+        fs::read_to_string(path).with_context(|| format!("Failed to read {:?}", path))?;
+    let mut entries = Vec::new();
+    for line in contents.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<SessionLogEntry>(line) {
+            Ok(e) => entries.push(e),
+            Err(e) => eprintln!("Warning: Failed to parse line in {:?} - {}", path, e),
+        }
+    }
+    Ok(entries)
+}
+
+// ── SQLite helpers ────────────────────────────────────────────────────────────
+
+fn open_db(obsidian_vault: &PathBuf) -> Result<Connection> {
+    let db_path = obsidian_vault.join(".metadata.db");
+    let conn = Connection::open(&db_path)
+        .with_context(|| format!("Failed to open SQLite DB at {:?}", db_path))?;
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL;
+         CREATE TABLE IF NOT EXISTS files (
+             path TEXT PRIMARY KEY,
+             mtime INTEGER NOT NULL,
+             size INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS session_files (
+             session_id TEXT NOT NULL,
+             file_path TEXT NOT NULL,
+             PRIMARY KEY (session_id, file_path)
+         );
+         CREATE TABLE IF NOT EXISTS sessions (
+             session_id TEXT PRIMARY KEY,
+             project TEXT,
+             output_path TEXT,
+             entry_count INTEGER DEFAULT 0,
+             synced_at INTEGER NOT NULL
+         );",
+    )?;
+    Ok(conn)
+}
+
+fn db_file_record(conn: &Connection, path: &str) -> Option<(i64, i64)> {
+    conn.query_row(
+        "SELECT mtime, size FROM files WHERE path = ?1",
+        params![path],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .ok()
+}
+
+fn db_upsert_file(conn: &Connection, path: &str, mtime: i64, size: i64) -> Result<()> {
+    conn.execute(
+        "INSERT INTO files (path, mtime, size) VALUES (?1, ?2, ?3)
+         ON CONFLICT(path) DO UPDATE SET mtime=excluded.mtime, size=excluded.size",
+        params![path, mtime, size],
+    )?;
     Ok(())
 }
 
-fn read_jsonl_files(projects_dir: &PathBuf, min_timestamp: u64) -> Result<Vec<SessionLogEntry>> {
-    let mut entries = Vec::new();
-
-    for entry in WalkDir::new(projects_dir)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("jsonl"))
-    {
-        let path = entry.path();
-        let contents = fs::read_to_string(path)
-            .with_context(|| format!("Failed to read {:?}", path))?;
-
-        for line in contents.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            match serde_json::from_str::<SessionLogEntry>(line) {
-                Ok(entry) => {
-                    let ts = entry.get_timestamp_millis();
-                    if ts > min_timestamp {
-                        entries.push(entry);
-                    }
-                }
-                Err(e) => eprintln!("Warning: Failed to parse line - {}", e),
-            }
-        }
-    }
-
-    entries.sort_by(|a, b| {
-        let a_ts = a.get_timestamp_millis();
-        let b_ts = b.get_timestamp_millis();
-        b_ts.cmp(&a_ts)
-    });
-    Ok(entries)
+fn db_upsert_session_files(
+    conn: &Connection,
+    session_id: &str,
+    file_path: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO session_files (session_id, file_path) VALUES (?1, ?2)",
+        params![session_id, file_path],
+    )?;
+    Ok(())
 }
 
-fn read_jsonl_files_for_sessions(
-    projects_dir: &PathBuf,
-    session_ids: &std::collections::HashSet<String>,
-) -> Result<Vec<SessionLogEntry>> {
-    let mut entries = Vec::new();
-
-    for entry in WalkDir::new(projects_dir)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("jsonl"))
-    {
-        let path = entry.path();
-        let contents = fs::read_to_string(path)
-            .with_context(|| format!("Failed to read {:?}", path))?;
-
-        for line in contents.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            match serde_json::from_str::<SessionLogEntry>(line) {
-                Ok(entry) => {
-                    if entry.session_id.as_deref().map(|id| session_ids.contains(id)).unwrap_or(false) {
-                        entries.push(entry);
-                    }
-                }
-                Err(_) => {}
-            }
-        }
-    }
-
-    entries.sort_by(|a, b| b.get_timestamp_millis().cmp(&a.get_timestamp_millis()));
-    Ok(entries)
+fn db_files_for_session(conn: &Connection, session_id: &str) -> Result<Vec<String>> {
+    let mut stmt =
+        conn.prepare("SELECT file_path FROM session_files WHERE session_id = ?1")?;
+    let paths: Vec<String> = stmt
+        .query_map(params![session_id], |row| row.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(paths)
 }
 
-fn group_entries_by_session(
-    entries: Vec<SessionLogEntry>,
-) -> BTreeMap<String, Vec<SessionLogEntry>> {
-    let mut grouped: BTreeMap<String, Vec<SessionLogEntry>> = BTreeMap::new();
-
-    for entry in entries {
-        let session_id = entry.session_id.as_deref().unwrap_or("unknown");
-        grouped
-            .entry(session_id.to_string())
-            .or_default()
-            .push(entry);
-    }
-
-    grouped
+fn db_upsert_session(
+    conn: &Connection,
+    session_id: &str,
+    project: Option<&str>,
+    output_path: &str,
+    entry_count: usize,
+    synced_at: i64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO sessions (session_id, project, output_path, entry_count, synced_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(session_id) DO UPDATE SET
+             project=excluded.project,
+             output_path=excluded.output_path,
+             entry_count=excluded.entry_count,
+             synced_at=excluded.synced_at",
+        params![session_id, project, output_path, entry_count as i64, synced_at],
+    )?;
+    Ok(())
 }
+
+/// Returns all sessions ordered by synced_at DESC.
+fn db_all_sessions(
+    conn: &Connection,
+) -> Result<Vec<(String, Option<String>, Option<String>, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT session_id, project, output_path, synced_at FROM sessions ORDER BY synced_at DESC",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(rows)
+}
+
+// ── Markdown generation ───────────────────────────────────────────────────────
 
 fn convert_session_to_markdown(entries: &[SessionLogEntry]) -> String {
     if entries.is_empty() {
@@ -320,8 +373,7 @@ fn convert_session_to_markdown(entries: &[SessionLogEntry]) -> String {
     markdown.push_str(&format!("# Session: {}\n\n", session_id));
     markdown.push_str(&format!("**Project:** {}\n", project));
 
-    // Collect agent IDs
-    let mut agent_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut agent_ids: HashSet<String> = HashSet::new();
     for entry in entries {
         if let Some(agent_id) = &entry.agent_id {
             if !agent_id.is_empty() {
@@ -329,20 +381,22 @@ fn convert_session_to_markdown(entries: &[SessionLogEntry]) -> String {
             }
         }
     }
-
     if !agent_ids.is_empty() {
-        markdown.push_str(&format!("**Subagents:** {}\n", agent_ids.iter().cloned().collect::<Vec<_>>().join(", ")));
+        let mut ids: Vec<_> = agent_ids.iter().cloned().collect();
+        ids.sort();
+        markdown.push_str(&format!("**Subagents:** {}\n", ids.join(", ")));
     }
-
     markdown.push_str(&format!("**Generated:** {}\n\n", chrono::Local::now()));
 
-    // For bash_progress entries, keep only the last one per parentToolUseID
-    let mut bash_progress_seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    // Keep only the first bash_progress entry per parentToolUseID
+    let mut bash_progress_seen: HashMap<String, usize> = HashMap::new();
     for (i, entry) in entries.iter().enumerate() {
         if entry.entry_type.as_deref() == Some("progress") {
             if let Some(data) = &entry.data {
                 if data.get("type").and_then(|t| t.as_str()) == Some("bash_progress") {
-                    let key = entry.parent_tool_use_id.clone()
+                    let key = entry
+                        .parent_tool_use_id
+                        .clone()
                         .or_else(|| entry.uuid.clone())
                         .unwrap_or_else(|| i.to_string());
                     bash_progress_seen.entry(key).or_insert(i);
@@ -350,19 +404,28 @@ fn convert_session_to_markdown(entries: &[SessionLogEntry]) -> String {
             }
         }
     }
-    let kept_bash_indices: std::collections::HashSet<usize> = bash_progress_seen.values().cloned().collect();
+    let kept_bash_indices: HashSet<usize> = bash_progress_seen.values().cloned().collect();
 
     let mut by_date: BTreeMap<String, Vec<&SessionLogEntry>> = BTreeMap::new();
-    let mut seen_content: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_content: HashSet<String> = HashSet::new();
+
     for (i, entry) in entries.iter().enumerate() {
         let is_bash_progress = entry.entry_type.as_deref() == Some("progress")
-            && entry.data.as_ref().and_then(|d| d.get("type")).and_then(|t| t.as_str()) == Some("bash_progress");
+            && entry
+                .data
+                .as_ref()
+                .and_then(|d| d.get("type"))
+                .and_then(|t| t.as_str())
+                == Some("bash_progress");
         if is_bash_progress && !kept_bash_indices.contains(&i) {
             continue;
         }
-        // Deduplicate identical content (e.g. same message sent to multiple agents)
         if let Some(display) = entry.get_display() {
-            let content_key = format!("{}:{}", entry.entry_type.as_deref().unwrap_or(""), display);
+            let content_key = format!(
+                "{}:{}",
+                entry.entry_type.as_deref().unwrap_or(""),
+                display
+            );
             if !seen_content.insert(content_key) {
                 continue;
             }
@@ -371,10 +434,10 @@ fn convert_session_to_markdown(entries: &[SessionLogEntry]) -> String {
         by_date.entry(date).or_default().push(entry);
     }
 
-    for (date, date_entries) in by_date.iter().rev() {
+    // Entries are sorted ascending; iterate dates ascending, entries ascending
+    for (date, date_entries) in by_date.iter() {
         markdown.push_str(&format!("## {}\n\n", date));
-
-        for entry in date_entries.iter().rev() {
+        for entry in date_entries.iter() {
             let role_prefix = match entry.entry_type.as_deref() {
                 Some("user") => "**User:** ",
                 Some("assistant") => "**Assistant:** ",
@@ -392,6 +455,8 @@ fn convert_session_to_markdown(entries: &[SessionLogEntry]) -> String {
     markdown
 }
 
+// ── main ──────────────────────────────────────────────────────────────────────
+
 fn main() -> Result<()> {
     let projects_dir = expand_home("~/.claude/projects");
     let obsidian_vault = expand_home("~/Documents/Obsidian/claude-code-sessions");
@@ -399,66 +464,151 @@ fn main() -> Result<()> {
     if !projects_dir.exists() {
         anyhow::bail!("Projects directory not found: {:?}", projects_dir);
     }
-
     if !obsidian_vault.exists() {
         fs::create_dir_all(&obsidian_vault)
             .with_context(|| format!("Failed to create {:?}", obsidian_vault))?;
         println!("Created Obsidian vault directory: {:?}", obsidian_vault);
     }
 
-    let metadata = load_metadata(&obsidian_vault);
-    println!("Last synced: {} entries at timestamp {}", metadata.total_entries_synced, metadata.last_synced_timestamp);
-
-    println!("Reading session logs from: {:?}", projects_dir);
-    let new_entries = read_jsonl_files(&projects_dir, metadata.last_synced_timestamp)?;
-    println!("Loaded {} new session entries", new_entries.len());
-
-    if new_entries.is_empty() {
-        println!("[OK] No new entries to sync");
-        return Ok(());
-    }
-
-    let max_timestamp = new_entries.iter()
-        .map(|e| e.get_timestamp_millis())
-        .max()
-        .unwrap_or(metadata.last_synced_timestamp);
-
     let sessions_dir = obsidian_vault.join("sessions");
     if !sessions_dir.exists() {
         fs::create_dir_all(&sessions_dir)?;
     }
 
-    println!("Converting and saving session files...");
+    let conn = open_db(&obsidian_vault)?;
 
-    // For sessions that already have output files, re-read their full history
-    let new_session_ids: std::collections::HashSet<String> = new_entries.iter()
-        .filter_map(|e| e.session_id.clone())
-        .collect();
-    let sessions_needing_reread: std::collections::HashSet<String> = new_session_ids.iter()
-        .filter(|id| sessions_dir.join(format!("{}.md", id.replace("/", "_"))).exists())
-        .cloned()
-        .collect();
+    // ── Step 1-4: Scan files, detect changes ─────────────────────────────────
+    let mut changed_files: Vec<PathBuf> = Vec::new();
+    let mut unchanged_files: Vec<PathBuf> = Vec::new();
 
-    let mut all_entries = new_entries.clone();
-    if !sessions_needing_reread.is_empty() {
-        println!("Re-reading full history for {} existing sessions...", sessions_needing_reread.len());
-        let old_entries = read_jsonl_files_for_sessions(&projects_dir, &sessions_needing_reread)?;
-        // Merge: deduplicate by uuid
-        let existing_uuids: std::collections::HashSet<String> = all_entries.iter()
-            .filter_map(|e| e.uuid.clone())
-            .collect();
-        for entry in old_entries {
-            let is_duplicate = entry.uuid.as_ref()
-                .map(|u| existing_uuids.contains(u))
-                .unwrap_or(false);
-            if !is_duplicate {
-                all_entries.push(entry);
+    for dir_entry in WalkDir::new(&projects_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("jsonl"))
+    {
+        let path = dir_entry.path().to_path_buf();
+        let path_str = path.to_string_lossy().to_string();
+        let (mtime, size) = file_mtime_and_size(&path)?;
+        match db_file_record(&conn, &path_str) {
+            Some((db_mtime, db_size)) if db_mtime == mtime && db_size == size => {
+                unchanged_files.push(path);
+            }
+            _ => {
+                changed_files.push(path);
             }
         }
-        all_entries.sort_by(|a, b| b.get_timestamp_millis().cmp(&a.get_timestamp_millis()));
     }
 
-    let grouped = group_entries_by_session(all_entries);
+    println!(
+        "Changed files: {}, Unchanged: {}",
+        changed_files.len(),
+        unchanged_files.len()
+    );
+
+    // ── Step 3: Read changed files, update DB, cache entries ─────────────────
+    // file_path -> Vec<SessionLogEntry>
+    let mut file_cache: HashMap<PathBuf, Vec<SessionLogEntry>> = HashMap::new();
+    let mut affected_sessions: HashSet<String> = HashSet::new();
+
+    for path in &changed_files {
+        let path_str = path.to_string_lossy().to_string();
+        let (mtime, size) = file_mtime_and_size(path)?;
+        let entries = parse_jsonl(path)?;
+
+        // Collect session_ids from this file
+        for entry in &entries {
+            if let Some(sid) = &entry.session_id {
+                if !sid.is_empty() {
+                    affected_sessions.insert(sid.clone());
+                    db_upsert_session_files(&conn, sid, &path_str)?;
+                }
+            }
+        }
+
+        db_upsert_file(&conn, &path_str, mtime, size)?;
+        file_cache.insert(path.clone(), entries);
+    }
+
+    // ── Step 6: Early exit if nothing changed ────────────────────────────────
+    if affected_sessions.is_empty() {
+        println!("No changes detected.");
+        return Ok(());
+    }
+
+    println!("Affected sessions: {}", affected_sessions.len());
+
+    // ── Step 7: For each affected session, collect ALL file paths, build entries
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    let mut written_count = 0usize;
+
+    for session_id in &affected_sessions {
+        // Get every file that has ever contributed to this session
+        let all_paths = db_files_for_session(&conn, session_id)?;
+
+        let mut session_entries: Vec<SessionLogEntry> = Vec::new();
+        let mut seen_uuids: HashSet<String> = HashSet::new();
+
+        for path_str in &all_paths {
+            let path = PathBuf::from(path_str);
+
+            // Use cache if available (changed file already read), else read now
+            let entries: Vec<SessionLogEntry> = if let Some(cached) = file_cache.get(&path) {
+                cached.clone()
+            } else {
+                parse_jsonl(&path).unwrap_or_default()
+            };
+
+            for entry in entries {
+                if entry.session_id.as_deref() != Some(session_id.as_str()) {
+                    continue;
+                }
+                // UUID dedup
+                let key = entry.uuid.clone().unwrap_or_else(|| {
+                    format!(
+                        "{}:{}",
+                        entry.get_timestamp_millis(),
+                        entry.entry_type.as_deref().unwrap_or("")
+                    )
+                });
+                if seen_uuids.insert(key) {
+                    session_entries.push(entry);
+                }
+            }
+        }
+
+        // Sort ascending by timestamp
+        session_entries.sort_by_key(|e| e.get_timestamp_millis());
+
+        let entry_count = session_entries.len();
+        let markdown = convert_session_to_markdown(&session_entries);
+
+        let safe_id = session_id.replace("/", "_");
+        let session_file = sessions_dir.join(format!("{}.md", safe_id));
+        let output_path = format!("sessions/{}.md", safe_id);
+        fs::write(&session_file, &markdown)?;
+        written_count += 1;
+
+        let project = session_entries
+            .first()
+            .and_then(|e| e.project.as_deref().or(e.cwd.as_deref()))
+            .map(get_project_name);
+
+        db_upsert_session(
+            &conn,
+            session_id,
+            project.as_deref(),
+            &output_path,
+            entry_count,
+            now_secs,
+        )?;
+    }
+
+    // ── Step 8: Write README from ALL sessions in DB ─────────────────────────
+    let all_sessions = db_all_sessions(&conn)?;
     let mut index_lines = vec![
         "# Claude Code Sessions Index".to_string(),
         "".to_string(),
@@ -467,39 +617,16 @@ fn main() -> Result<()> {
         "## Sessions".to_string(),
         "".to_string(),
     ];
-
-    let mut total_files = 0;
-    for (session_id, entries) in grouped.iter() {
-        let markdown = convert_session_to_markdown(entries);
-        let safe_session_id = session_id.replace("/", "_");
-        let session_file = sessions_dir.join(format!("{}.md", safe_session_id));
-        fs::write(&session_file, &markdown)?;
-        total_files += 1;
-
-        let project = entries
-            .first()
-            .and_then(|e| e.project.as_deref().or(e.cwd.as_deref()))
-            .map(get_project_name)
-            .unwrap_or_else(|| "unknown".to_string());
-        let project = project.as_str();
-        index_lines.push(format!("- [{}]({}) - {}", session_id, format!("sessions/{}.md", safe_session_id), project));
+    for (sid, project, output_path, _synced_at) in &all_sessions {
+        let proj = project.as_deref().unwrap_or("unknown");
+        let path = output_path.as_deref().unwrap_or("");
+        index_lines.push(format!("- [{}]({}) - {}", sid, path, proj));
     }
-
     let index_content = index_lines.join("\n");
-    let index_file = obsidian_vault.join("README.md");
-    fs::write(&index_file, &index_content)?;
+    fs::write(obsidian_vault.join("README.md"), &index_content)?;
 
-    let updated_metadata = Metadata {
-        last_synced_timestamp: max_timestamp,
-        total_entries_synced: metadata.total_entries_synced + new_entries.len(),
-    };
-    save_metadata(&obsidian_vault, &updated_metadata)?;
-
-    println!("[OK] Synced to {:?}", sessions_dir);
-    println!("  New sessions: {}", total_files);
-    println!("  New entries: {}", new_entries.len());
-    println!("  Total synced: {}", updated_metadata.total_entries_synced);
-    println!("[OK] Index created: {:?}", index_file);
+    println!("Written: {} sessions", written_count);
+    println!("Index updated: {} total sessions", all_sessions.len());
 
     Ok(())
 }
