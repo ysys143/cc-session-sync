@@ -204,6 +204,13 @@ fn format_time(timestamp: u64) -> String {
     dt.format("%H:%M:%S").to_string()
 }
 
+fn format_datetime(timestamp: u64) -> String {
+    let dt = DateTime::<Local>::from(
+        SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(timestamp),
+    );
+    dt.format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
 fn get_project_name(project_path: &str) -> String {
     PathBuf::from(project_path)
         .file_name()
@@ -241,6 +248,56 @@ fn parse_jsonl(path: &PathBuf) -> Result<Vec<SessionLogEntry>> {
     Ok(entries)
 }
 
+/// Extract the first "real" user message as a summary (max 100 chars, no newlines).
+fn extract_summary(entries: &[SessionLogEntry]) -> String {
+    for entry in entries {
+        if entry.entry_type.as_deref() != Some("user") {
+            continue;
+        }
+        if entry.is_sidechain {
+            continue;
+        }
+        if let Some(display) = entry.get_display() {
+            let trimmed = display.trim();
+            if trimmed.starts_with("<command")
+                || trimmed.starts_with("<local-command")
+                || trimmed.starts_with("<bash-")
+                || trimmed.contains("<bash-stdout>")
+                || trimmed.contains("<bash-stderr>")
+                || trimmed.starts_with('>')
+                || trimmed.starts_with('/')
+                || trimmed.starts_with("Warmup")
+                || trimmed.starts_with("You are")
+                || trimmed.starts_with("Base directory")
+            {
+                continue;
+            }
+            // Strip "요약할 텍스트:" prefix if present
+            let text = if let Some(rest) = trimmed.strip_prefix("요약할 텍스트:") {
+                rest.trim()
+            } else {
+                trimmed
+            };
+            // Strip newlines; skip table rows and XML-tagged lines
+            let single_line: String = text
+                .lines()
+                .map(|l| l.trim())
+                .filter(|l| !l.is_empty() && !l.starts_with('|') && !l.starts_with('<'))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let truncated = if single_line.chars().count() > 100 {
+                single_line.chars().take(100).collect::<String>()
+            } else {
+                single_line
+            };
+            if !truncated.is_empty() {
+                return truncated;
+            }
+        }
+    }
+    String::new()
+}
+
 // ── SQLite helpers ────────────────────────────────────────────────────────────
 
 fn open_db(obsidian_vault: &PathBuf) -> Result<Connection> {
@@ -267,6 +324,9 @@ fn open_db(obsidian_vault: &PathBuf) -> Result<Connection> {
              synced_at INTEGER NOT NULL
          );",
     )?;
+    // Add new columns safely (SQLite doesn't support ADD COLUMN IF NOT EXISTS)
+    conn.execute("ALTER TABLE sessions ADD COLUMN summary TEXT", []).ok();
+    conn.execute("ALTER TABLE sessions ADD COLUMN session_datetime TEXT", []).ok();
     Ok(conn)
 }
 
@@ -317,26 +377,34 @@ fn db_upsert_session(
     output_path: &str,
     entry_count: usize,
     synced_at: i64,
+    summary: &str,
+    session_datetime: &str,
 ) -> Result<()> {
     conn.execute(
-        "INSERT INTO sessions (session_id, project, output_path, entry_count, synced_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)
+        "INSERT INTO sessions (session_id, project, output_path, entry_count, synced_at, summary, session_datetime)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
          ON CONFLICT(session_id) DO UPDATE SET
              project=excluded.project,
              output_path=excluded.output_path,
              entry_count=excluded.entry_count,
-             synced_at=excluded.synced_at",
-        params![session_id, project, output_path, entry_count as i64, synced_at],
+             synced_at=excluded.synced_at,
+             summary=excluded.summary,
+             session_datetime=excluded.session_datetime",
+        params![session_id, project, output_path, entry_count as i64, synced_at, summary, session_datetime],
     )?;
     Ok(())
 }
 
-/// Returns all sessions ordered by synced_at DESC.
+/// Returns all sessions ordered by session_datetime DESC, then synced_at DESC.
 fn db_all_sessions(
     conn: &Connection,
-) -> Result<Vec<(String, Option<String>, Option<String>, i64)>> {
+) -> Result<Vec<(String, Option<String>, Option<String>, Option<String>, Option<String>)>> {
     let mut stmt = conn.prepare(
-        "SELECT session_id, project, output_path, synced_at FROM sessions ORDER BY synced_at DESC",
+        "SELECT session_id, project, output_path, summary, session_datetime
+         FROM sessions
+         WHERE session_datetime IS NOT NULL AND session_datetime != ''
+         ORDER BY session_datetime DESC
+         LIMIT 500",
     )?;
     let rows = stmt
         .query_map([], |row| {
@@ -344,7 +412,8 @@ fn db_all_sessions(
                 row.get::<_, String>(0)?,
                 row.get::<_, Option<String>>(1)?,
                 row.get::<_, Option<String>>(2)?,
-                row.get::<_, i64>(3)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
             ))
         })?
         .filter_map(|r| r.ok())
@@ -354,21 +423,51 @@ fn db_all_sessions(
 
 // ── Markdown generation ───────────────────────────────────────────────────────
 
-fn convert_session_to_markdown(entries: &[SessionLogEntry]) -> String {
+/// Returns (markdown, summary, session_datetime)
+fn convert_session_to_markdown(entries: &[SessionLogEntry]) -> (String, String, String) {
     if entries.is_empty() {
-        return String::new();
+        return (String::new(), String::new(), String::new());
     }
 
-    let mut markdown = String::new();
+    // Find the earliest timestamp
+    let earliest_ts = entries
+        .iter()
+        .map(|e| e.get_timestamp_millis())
+        .filter(|&t| t > 0)
+        .min()
+        .unwrap_or(0);
+
+    let session_date = if earliest_ts > 0 { format_date(earliest_ts) } else { String::new() };
+    let session_time = if earliest_ts > 0 { format_time(earliest_ts) } else { String::new() };
+    let session_datetime = if earliest_ts > 0 { format_datetime(earliest_ts) } else { String::new() };
+
     let session_id = entries
         .first()
         .and_then(|e| e.session_id.as_deref())
         .unwrap_or("unknown");
-    let project = entries
+    let cwd = entries
         .first()
-        .and_then(|e| e.project.as_deref().or(e.cwd.as_deref()))
-        .map(get_project_name)
-        .unwrap_or_else(|| "unknown".to_string());
+        .and_then(|e| e.cwd.as_deref().or(e.project.as_deref()))
+        .unwrap_or("");
+    let project = if cwd.is_empty() {
+        "unknown".to_string()
+    } else {
+        get_project_name(cwd)
+    };
+
+    let summary = extract_summary(entries);
+
+    let mut markdown = String::new();
+
+    // YAML frontmatter
+    markdown.push_str("---\n");
+    markdown.push_str(&format!("date: {}\n", session_date));
+    markdown.push_str(&format!("time: {}\n", session_time));
+    markdown.push_str(&format!("datetime: {}\n", session_datetime));
+    markdown.push_str(&format!("project: {}\n", project));
+    markdown.push_str(&format!("cwd: {}\n", cwd));
+    markdown.push_str(&format!("summary: {}\n", summary));
+    markdown.push_str("---\n\n");
 
     markdown.push_str(&format!("# Session: {}\n\n", session_id));
     markdown.push_str(&format!("**Project:** {}\n", project));
@@ -452,7 +551,7 @@ fn convert_session_to_markdown(entries: &[SessionLogEntry]) -> String {
         }
     }
 
-    markdown
+    (markdown, summary, session_datetime)
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
@@ -586,7 +685,7 @@ fn main() -> Result<()> {
         session_entries.sort_by_key(|e| e.get_timestamp_millis());
 
         let entry_count = session_entries.len();
-        let markdown = convert_session_to_markdown(&session_entries);
+        let (markdown, summary, session_datetime) = convert_session_to_markdown(&session_entries);
 
         let safe_id = session_id.replace("/", "_");
         let session_file = sessions_dir.join(format!("{}.md", safe_id));
@@ -606,26 +705,33 @@ fn main() -> Result<()> {
             &output_path,
             entry_count,
             now_secs,
+            &summary,
+            &session_datetime,
         )?;
     }
 
-    // ── Step 8: Write README from ALL sessions in DB ─────────────────────────
+    // ── Step 8: Write _index.md from ALL sessions in DB ──────────────────────
     let all_sessions = db_all_sessions(&conn)?;
     let mut index_lines = vec![
-        "# Claude Code Sessions Index".to_string(),
+        "# Claude Code Sessions".to_string(),
         "".to_string(),
-        format!("Generated: {}", chrono::Local::now()),
-        "".to_string(),
-        "## Sessions".to_string(),
-        "".to_string(),
+        "| Datetime | Project | Session | Summary |".to_string(),
+        "|----------|---------|---------|---------|".to_string(),
     ];
-    for (sid, project, output_path, _synced_at) in &all_sessions {
+    for (sid, project, output_path, summary, session_datetime) in &all_sessions {
         let proj = project.as_deref().unwrap_or("unknown");
         let path = output_path.as_deref().unwrap_or("");
-        index_lines.push(format!("- [{}]({}) - {}", sid, path, proj));
+        let dt = session_datetime.as_deref().unwrap_or("");
+        let sum = summary.as_deref().unwrap_or("");
+        // Short ID for display (first 8 chars)
+        let short_id = if sid.len() >= 8 { &sid[..8] } else { sid.as_str() };
+        index_lines.push(format!(
+            "| {} | {} | [{}]({}) | {} |",
+            dt, proj, short_id, path, sum
+        ));
     }
     let index_content = index_lines.join("\n");
-    fs::write(obsidian_vault.join("README.md"), &index_content)?;
+    fs::write(obsidian_vault.join("_index.md"), &index_content)?;
 
     println!("Written: {} sessions", written_count);
     println!("Index updated: {} total sessions", all_sessions.len());
