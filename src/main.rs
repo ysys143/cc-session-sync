@@ -396,30 +396,6 @@ fn db_upsert_session(
 }
 
 /// Returns all sessions ordered by session_datetime DESC, then synced_at DESC.
-fn db_all_sessions(
-    conn: &Connection,
-) -> Result<Vec<(String, Option<String>, Option<String>, Option<String>, Option<String>)>> {
-    let mut stmt = conn.prepare(
-        "SELECT session_id, project, output_path, summary, session_datetime
-         FROM sessions
-         WHERE session_datetime IS NOT NULL AND session_datetime != ''
-         ORDER BY session_datetime DESC
-         LIMIT 500",
-    )?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, Option<String>>(4)?,
-            ))
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
-    Ok(rows)
-}
 
 // ── Markdown generation ───────────────────────────────────────────────────────
 
@@ -710,31 +686,7 @@ fn main() -> Result<()> {
         )?;
     }
 
-    // ── Step 8: Write _index.md from ALL sessions in DB ──────────────────────
-    let all_sessions = db_all_sessions(&conn)?;
-    let mut index_lines = vec![
-        "# Claude Code Sessions".to_string(),
-        "".to_string(),
-        "| Datetime | Project | Session | Summary |".to_string(),
-        "|----------|---------|---------|---------|".to_string(),
-    ];
-    for (sid, project, output_path, summary, session_datetime) in &all_sessions {
-        let proj = project.as_deref().unwrap_or("unknown");
-        let path = output_path.as_deref().unwrap_or("");
-        let dt = session_datetime.as_deref().unwrap_or("");
-        let sum = summary.as_deref().unwrap_or("");
-        // Short ID for display (first 8 chars)
-        let short_id = if sid.len() >= 8 { &sid[..8] } else { sid.as_str() };
-        index_lines.push(format!(
-            "| {} | {} | [{}]({}) | {} |",
-            dt, proj, short_id, path, sum
-        ));
-    }
-    let index_content = index_lines.join("\n");
-    fs::write(obsidian_vault.join("_index.md"), &index_content)?;
-
     println!("Written: {} sessions", written_count);
-    println!("Index updated: {} total sessions", all_sessions.len());
 
     Ok(())
 }
