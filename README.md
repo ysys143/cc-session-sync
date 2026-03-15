@@ -1,4 +1,4 @@
-# sync-sessions-to-obsidian
+# cc-session-sync
 
 A Rust CLI tool that converts Claude Code JSONL session logs to formatted markdown with SQLite-based incremental synchronization.
 
