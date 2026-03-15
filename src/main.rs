@@ -219,6 +219,16 @@ fn get_project_name(project_path: &str) -> String {
         .to_string()
 }
 
+/// Extract project name from JSONL file path.
+/// ~/.claude/projects/-Users-foo-bar-my-project/session.jsonl → "my-project"
+fn project_from_jsonl_path(path: &PathBuf) -> Option<String> {
+    let encoded = path.parent()?.file_name()?.to_str()?;
+    // Encoded path uses "-" as path separator (leading "-" = root "/")
+    // Take the last segment after splitting by "-"
+    let segments: Vec<&str> = encoded.split('-').filter(|s| !s.is_empty()).collect();
+    segments.last().map(|s| s.to_string())
+}
+
 fn file_mtime_and_size(path: &PathBuf) -> Result<(i64, i64)> {
     let meta = fs::metadata(path).with_context(|| format!("stat {:?}", path))?;
     let mtime = meta
@@ -422,8 +432,11 @@ fn convert_session_to_markdown(entries: &[SessionLogEntry]) -> (String, String, 
         .and_then(|e| e.session_id.as_deref())
         .unwrap_or("unknown");
     let cwd = entries
-        .first()
-        .and_then(|e| e.cwd.as_deref().or(e.project.as_deref()))
+        .iter()
+        .find_map(|e| {
+            e.cwd.as_deref().filter(|s| !s.is_empty())
+                .or_else(|| e.project.as_deref().filter(|s| !s.is_empty()))
+        })
         .unwrap_or("");
     let project = if cwd.is_empty() {
         "unknown".to_string()
@@ -670,9 +683,17 @@ fn main() -> Result<()> {
         written_count += 1;
 
         let project = session_entries
-            .first()
-            .and_then(|e| e.project.as_deref().or(e.cwd.as_deref()))
-            .map(get_project_name);
+            .iter()
+            .find_map(|e| {
+                e.cwd.as_deref().filter(|s| !s.is_empty())
+                    .or_else(|| e.project.as_deref().filter(|s| !s.is_empty()))
+            })
+            .map(get_project_name)
+            .or_else(|| {
+                // Fallback: derive from the JSONL file path
+                all_paths.first()
+                    .and_then(|p| project_from_jsonl_path(&PathBuf::from(p)))
+            });
 
         db_upsert_session(
             &conn,
